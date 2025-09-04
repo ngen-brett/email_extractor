@@ -2,6 +2,7 @@
 """
 IMAP Email Search and Export Tool
 Connects to IMAP servers, searches messages, and exports to .eml and .pdf formats
+Enhanced: Multi-folder search capability and Unicode character support
 """
 
 import imaplib
@@ -23,26 +24,80 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def clean_text_for_pdf(text):
+    """Clean text for PDF rendering, removing problematic Unicode characters"""
+    if not text:
+        return ""
+    
+    # Remove Zero Width characters that cause rendering issues
+    text = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E]', '', text)
+    
+    # Replace smart quotes and special characters with ASCII equivalents
+    text = text.replace('\u201C', '"').replace('\u201D', '"')  # Smart double quotes  
+    text = text.replace('\u2018', "'").replace('\u2019', "'")  # Smart single quotes/apostrophes
+    text = text.replace('\u2013', '-').replace('\u2014', '-')  # En dash, em dash
+    text = text.replace('\u2026', '...')  # Ellipsis
+    text = text.replace('\u2022', '*')    # Bullet point
+    text = text.replace('\u00B0', ' degrees ')  # Degree symbol
+    
+    # Remove control characters except newlines and tabs
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+    
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    
+    # Final safety check: keep only characters that can be encoded in latin-1
+    try:
+        text.encode('latin-1')
+        return text
+    except UnicodeEncodeError:
+        # Filter to ASCII printable characters only
+        safe_chars = []
+        for char in text:
+            if ord(char) < 128 and (char.isprintable() or char in '\n\t '):
+                safe_chars.append(char)
+            else:
+                safe_chars.append('?')  # Replace problematic chars with ?
+        return ''.join(safe_chars)
+
 class EmailPDF(FPDF):
     """Custom FPDF class for email formatting with headers and footers"""
     
     def __init__(self, email_subject=""):
-        super().__init__()
-        self.email_subject = email_subject
-        self.set_auto_page_break(auto=True, margin=15)
+        super().__init__(orientation='P', unit='mm', format='A4')
+        self.email_subject = clean_text_for_pdf(email_subject)
+        # Set proper margins to prevent horizontal space issues
+        self.set_margins(left=20, top=20, right=20)
+        self.set_auto_page_break(auto=True, margin=25)
+        
+        # Add Unicode font support for special characters
+        try:
+            # Try to add DejaVu font for Unicode support
+            self.add_font("DejaVu", "", "DejaVuSans.ttf")
+            self.unicode_font_available = True
+        except:
+            # Fall back to Arial if DejaVu not available
+            self.unicode_font_available = False
     
     def header(self):
         """Page header"""
-        self.set_font('Arial', 'B', 12)
-        # Truncate long subjects for header
+        font_name = "DejaVu" if self.unicode_font_available else "Arial"
+        self.set_font(font_name, 'B', 12)
+        # Truncate and clean subject for header
         header_text = self.email_subject[:50] + "..." if len(self.email_subject) > 50 else self.email_subject
-        self.cell(0, 10, f'Email: {header_text}', 0, 1, 'C')
+        try:
+            self.cell(0, 10, f'Email: {header_text}', 0, 1, 'C')
+        except:
+            # Fallback for problematic characters
+            self.cell(0, 10, 'Email: [Subject contains unsupported characters]', 0, 1, 'C')
         self.ln(5)
     
     def footer(self):
         """Page footer with page numbers"""
         self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
+        font_name = "DejaVu" if self.unicode_font_available else "Arial"
+        self.set_font(font_name, 'I', 8)
         self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
 
 def sanitize_filename(text):
@@ -56,24 +111,71 @@ def sanitize_filename(text):
     # Remove leading/trailing hyphens
     return sanitized.strip('-')
 
-def sanitize_folder_name(text):
-    """Sanitize text for folder names (same as filename but for consistency)"""
-    return sanitize_filename(text)
+def parse_folder_list(folder_line):
+    """Parse IMAP folder list response to extract folder name"""
+    try:
+        # Decode bytes to string
+        folder_str = folder_line.decode() if isinstance(folder_line, bytes) else folder_line
+        
+        # Extract folder name from IMAP list response
+        # Format: (flags) "delimiter" "folder_name"
+        parts = folder_str.split(' "')
+        if len(parts) >= 3:
+            folder_name = parts[2].rstrip('"')
+            return folder_name
+        
+        # Alternative parsing for different server responses
+        match = re.search(r'"([^"]*)"$', folder_str)
+        if match:
+            return match.group(1)
+        
+        return None
+    except Exception as e:
+        logger.warning(f"Error parsing folder: {e}")
+        return None
+
+def get_all_folders(imap_conn, verbose=False):
+    """Get list of all available folders in the mailbox"""
+    try:
+        typ, folder_data = imap_conn.list()
+        
+        if typ != "OK":
+            logger.warning("Failed to get folder list")
+            return ["INBOX"]  # Fallback to INBOX only
+        
+        folders = []
+        for folder_line in folder_data:
+            folder_name = parse_folder_list(folder_line)
+            if folder_name:
+                folders.append(folder_name)
+        
+        if verbose:
+            print(f"Available folders: {folders}")
+        
+        # Ensure INBOX is included if not found
+        if "INBOX" not in folders:
+            folders.insert(0, "INBOX")
+        
+        return folders
+    
+    except Exception as e:
+        logger.warning(f"Error getting folder list: {e}")
+        return ["INBOX"]  # Fallback to INBOX only
 
 def build_export_folder(base_path, search_date, sender=None, recipient=None, keywords=None):
     """Build export folder path based on search criteria"""
     folder_parts = []
     
     # Always include date
-    folder_parts.append(sanitize_folder_name(search_date))
+    folder_parts.append(sanitize_filename(search_date))
     
     # Add other criteria if provided
     if sender:
-        folder_parts.append(sanitize_folder_name(sender))
+        folder_parts.append(sanitize_filename(sender))
     if recipient:
-        folder_parts.append(sanitize_folder_name(recipient))
+        folder_parts.append(sanitize_filename(recipient))
     if keywords:
-        folder_parts.append(sanitize_folder_name(keywords))
+        folder_parts.append(sanitize_filename(keywords))
     
     folder_name = '_'.join(folder_parts)
     full_path = Path(base_path) / folder_name
@@ -154,6 +256,7 @@ def extract_text_from_email(msg):
         h = html2text.HTML2Text()
         h.ignore_links = False
         h.ignore_images = True
+        h.body_width = 0  # No line wrapping
         return h.handle(html_content).strip()
     else:
         return "No readable content found"
@@ -201,12 +304,26 @@ def connect_imap(host, port, crypt, username, password):
         logger.error(f"Failed to connect to IMAP server: {e}")
         sys.exit(1)
 
-def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date, case_sensitive, verbose=False):
-    """Search for messages matching criteria"""
-    logger.info("Searching for messages...")
-    
+def search_folder_messages(imap_conn, folder_name, sender, recipient, keywords, start_date, end_date, case_sensitive, verbose=False):
+    """Search for messages in a specific folder matching criteria"""
     try:
-        imap_conn.select("INBOX")
+        # Select folder (some folders may need quotes)
+        try:
+            typ, data = imap_conn.select(f'"{folder_name}"', readonly=True)
+        except:
+            typ, data = imap_conn.select(folder_name, readonly=True)
+        
+        if typ != "OK":
+            if verbose:
+                print(f"  ❌ Cannot access folder: {folder_name}")
+            return []
+        
+        folder_message_count = int(data[0]) if data[0] else 0
+        if verbose:
+            print(f"  📁 Folder '{folder_name}': {folder_message_count} messages")
+        
+        if folder_message_count == 0:
+            return []
         
         # Build search criteria - default to ALL (no date restriction)
         search_criteria = ["ALL"]
@@ -215,25 +332,22 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
         if start_date:
             since_str = start_date.strftime("%d-%b-%Y")
             search_criteria.append(f'SINCE "{since_str}"')
-            logger.info(f"Searching from: {since_str}")
         
         if end_date:
             before_str = end_date.strftime("%d-%b-%Y") 
             search_criteria.append(f'BEFORE "{before_str}"')
-            logger.info(f"Searching until: {before_str}")
-        
-        if not start_date and not end_date:
-            logger.info("Searching all messages (no date range specified)")
         
         # Execute search
         typ, message_ids = imap_conn.search(None, *search_criteria)
         
         if typ != "OK":
-            logger.error("Failed to search messages")
+            if verbose:
+                print(f"  ❌ Search failed in folder: {folder_name}")
             return []
         
         ids = message_ids[0].split()
-        logger.info(f"Found {len(ids)} messages in search range")
+        if verbose and len(ids) > 0:
+            print(f"  🔍 Found {len(ids)} messages in date range")
         
         # Filter messages by sender, recipient, and keywords
         matching_messages = []
@@ -263,12 +377,12 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
                 
                 # Verbose output - show message being reviewed
                 if verbose:
-                    print(f"\n[{i}/{len(ids)}] Reviewing message:")
-                    print(f"  Date: {date_header}")
-                    print(f"  From: {from_addr}")
-                    print(f"  To: {to_addr}")
-                    print(f"  Subject: {subject}")
-                    print(f"  Body preview: {body_text[:100]}{'...' if len(body_text) > 100 else ''}")
+                    print(f"\n    [{i}/{len(ids)}] Reviewing in {folder_name}:")
+                    print(f"      Date: {date_header}")
+                    print(f"      From: {from_addr}")
+                    print(f"      To: {to_addr}")
+                    print(f"      Subject: {subject}")
+                    print(f"      Body preview: {body_text[:100]}{'...' if len(body_text) > 100 else ''}")
                 
                 # Apply filters
                 def matches(search_term, text_to_search):
@@ -284,10 +398,10 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
                 keyword_match = matches(keywords, f"{subject} {body_text}")
                 
                 if verbose:
-                    print(f"  Sender match: {sender_match} (searching for: {sender or 'ANY'})")
-                    print(f"  Recipient match: {recipient_match} (searching for: {recipient or 'ANY'})")
-                    print(f"  Keyword match: {keyword_match} (searching for: {keywords or 'ANY'})")
-                    print(f"  Overall match: {sender_match and recipient_match and keyword_match}")
+                    print(f"      Sender match: {sender_match} (searching for: {sender or 'ANY'})")
+                    print(f"      Recipient match: {recipient_match} (searching for: {recipient or 'ANY'})")
+                    print(f"      Keyword match: {keyword_match} (searching for: {keywords or 'ANY'})")
+                    print(f"      Overall match: {sender_match and recipient_match and keyword_match}")
                 
                 if sender_match and recipient_match and keyword_match:
                     # Parse email date
@@ -298,6 +412,7 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
                     
                     matching_messages.append({
                         "id": msg_id.decode(),
+                        "folder": folder_name,
                         "from": from_addr,
                         "to": to_addr,
                         "subject": subject,
@@ -309,20 +424,49 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
                     })
                     
                     if verbose:
-                        print(f"  ✅ MATCH FOUND - Added to results")
+                        print(f"      ✅ MATCH FOUND - Added to results")
                 
             except Exception as e:
-                logger.warning(f"Error processing message {msg_id}: {e}")
+                logger.warning(f"Error processing message {msg_id} in {folder_name}: {e}")
                 if verbose:
-                    print(f"  ❌ ERROR processing message: {e}")
+                    print(f"      ❌ ERROR processing message: {e}")
                 continue
         
-        logger.info(f"Found {len(matching_messages)} matching messages")
+        if verbose and matching_messages:
+            print(f"  ✅ Found {len(matching_messages)} matching messages in {folder_name}")
+        
         return matching_messages
     
     except Exception as e:
-        logger.error(f"Error during message search: {e}")
+        logger.warning(f"Error searching folder {folder_name}: {e}")
         return []
+
+def search_all_messages(imap_conn, sender, recipient, keywords, start_date, end_date, case_sensitive, search_all_folders=False, verbose=False):
+    """Search for messages across all folders or just INBOX"""
+    logger.info("Searching for messages...")
+    
+    if search_all_folders:
+        folders = get_all_folders(imap_conn, verbose)
+        logger.info(f"Searching across {len(folders)} folders")
+    else:
+        folders = ["INBOX"]
+        logger.info("Searching INBOX only")
+    
+    all_matching_messages = []
+    
+    for folder in folders:
+        if verbose:
+            print(f"\n🔍 Searching folder: {folder}")
+        
+        folder_matches = search_folder_messages(
+            imap_conn, folder, sender, recipient, keywords, 
+            start_date, end_date, case_sensitive, verbose
+        )
+        
+        all_matching_messages.extend(folder_matches)
+    
+    logger.info(f"Found {len(all_matching_messages)} total matching messages across all searched folders")
+    return all_matching_messages
 
 def save_message_files(message, export_folder, verbose=False):
     """Save message as both .eml and .pdf files"""
@@ -349,6 +493,7 @@ def save_message_files(message, export_folder, verbose=False):
         
         if verbose:
             print(f"Saving files with base name: {base_filename}")
+            print(f"  Source folder: {message.get('folder', 'UNKNOWN')}")
         
         # Save .eml file
         eml_path = Path(export_folder) / f"{base_filename}.eml"
@@ -358,45 +503,91 @@ def save_message_files(message, export_folder, verbose=False):
         if verbose:
             print(f"  ✅ Saved EML: {eml_path}")
         
-        # Create PDF with unbreakable header section
+        # Create PDF with Unicode support
         pdf = EmailPDF(message["subject"])
         pdf.add_page()
-        pdf.set_font("Arial", size=10)
         
-        # Header information in unbreakable section
-        with pdf.unbreakable() as doc:
-            doc.set_font("Arial", "B", 12)
-            doc.cell(0, 8, "Email Message", ln=1, align="C")
-            doc.ln(3)
-            
-            doc.set_font("Arial", "B", 10)
-            doc.cell(30, 6, "Date:", border=0)
-            doc.set_font("Arial", size=10)
-            doc.cell(0, 6, message["date_header"], ln=1, border=0)
-            
-            doc.set_font("Arial", "B", 10)  
-            doc.cell(30, 6, "From:", border=0)
-            doc.set_font("Arial", size=10)
-            doc.multi_cell(0, 6, message["from"], border=0)
-            
-            doc.set_font("Arial", "B", 10)
-            doc.cell(30, 6, "To:", border=0)
-            doc.set_font("Arial", size=10)
-            doc.multi_cell(0, 6, message["to"], border=0)
-            
-            doc.set_font("Arial", "B", 10)
-            doc.cell(30, 6, "Subject:", border=0)
-            doc.set_font("Arial", size=10)
-            doc.multi_cell(0, 6, message["subject"], border=0)
-            
-            doc.ln(5)
-            doc.set_font("Arial", "B", 10)
-            doc.cell(0, 6, "Message Body:", ln=1, border=0)
-            doc.ln(2)
+        # Clean all text for PDF rendering
+        safe_from = clean_text_for_pdf(message["from"])
+        safe_to = clean_text_for_pdf(message["to"])
+        safe_subject = clean_text_for_pdf(message["subject"])
+        safe_body = clean_text_for_pdf(message["body"])
+        safe_date = clean_text_for_pdf(message["date_header"])
+        safe_folder = clean_text_for_pdf(message.get("folder", "UNKNOWN"))
         
-        # Message body with automatic page breaks
-        pdf.set_font("Arial", size=10)
-        pdf.multi_cell(0, 5, message["body"])
+        # Choose font based on availability
+        font_name = "DejaVu" if pdf.unicode_font_available else "Arial"
+        
+        # Header information with safe layout
+        pdf.set_font(font_name, "B", 14)
+        pdf.cell(0, 10, "Email Message", ln=1, align="C")
+        pdf.ln(5)
+        
+        # Email metadata using only cell() to prevent multi_cell issues
+        pdf.set_font(font_name, "B", 10)
+        pdf.cell(25, 6, "Folder:", border=0)
+        pdf.set_font(font_name, "", 10)
+        pdf.cell(145, 6, safe_folder[:70], ln=1, border=0)
+        
+        pdf.set_font(font_name, "B", 10)
+        pdf.cell(25, 6, "Date:", border=0)
+        pdf.set_font(font_name, "", 10)
+        pdf.cell(145, 6, safe_date[:70], ln=1, border=0)
+        
+        pdf.set_font(font_name, "B", 10)
+        pdf.cell(25, 6, "From:", border=0)
+        pdf.set_font(font_name, "", 10)
+        pdf.cell(145, 6, safe_from[:70], ln=1, border=0)
+        
+        pdf.set_font(font_name, "B", 10)
+        pdf.cell(25, 6, "To:", border=0)
+        pdf.set_font(font_name, "", 10)
+        pdf.cell(145, 6, safe_to[:70], ln=1, border=0)
+        
+        pdf.set_font(font_name, "B", 10)
+        pdf.cell(25, 6, "Subject:", border=0)
+        pdf.set_font(font_name, "", 10)
+        pdf.cell(145, 6, safe_subject[:70], ln=1, border=0)
+        
+        pdf.ln(8)
+        pdf.set_font(font_name, "B", 10)
+        pdf.cell(0, 6, "Message Body:", ln=1, border=0)
+        pdf.ln(3)
+        
+        # Message body with conservative approach
+        pdf.set_font(font_name, "", 9)
+        
+        # Truncate extremely long bodies
+        if len(safe_body) > 5000:
+            safe_body = safe_body[:5000] + "\n\n[MESSAGE TRUNCATED - Original too long for PDF display]"
+        
+        # Split body into lines and use cell() for better control
+        body_lines = safe_body.split('\n')
+        for line in body_lines:
+            if len(line) > 80:
+                # Split very long lines
+                words = line.split(' ')
+                current_line = ""
+                for word in words:
+                    if len(current_line + word) < 80:
+                        current_line += word + " "
+                    else:
+                        if current_line:
+                            try:
+                                pdf.cell(0, 5, current_line.strip(), ln=1, border=0)
+                            except:
+                                pdf.cell(0, 5, "[Line contains unsupported characters]", ln=1, border=0)
+                        current_line = word + " "
+                if current_line:
+                    try:
+                        pdf.cell(0, 5, current_line.strip(), ln=1, border=0)
+                    except:
+                        pdf.cell(0, 5, "[Line contains unsupported characters]", ln=1, border=0)
+            else:
+                try:
+                    pdf.cell(0, 5, line, ln=1, border=0)
+                except:
+                    pdf.cell(0, 5, "[Line contains unsupported characters]", ln=1, border=0)
         
         # Save PDF
         pdf_path = Path(export_folder) / f"{base_filename}.pdf"
@@ -422,8 +613,8 @@ def main():
         epilog="""
 Examples:
   %(prog)s --mailhost imap.gmail.com --username user@gmail.com --password pass --sender boss@company.com
-  %(prog)s --env config.env --keywords "urgent project" --start-date 2023-01-01
-  %(prog)s --mailhost mail.company.com --crypt starttls --recipient client@company.com --verbose
+  %(prog)s --env config.env --keywords "urgent project" --start-date 2023-01-01 --all-folders
+  %(prog)s --mailhost mail.company.com --crypt starttls --recipient client@company.com --verbose --all-folders
         """
     )
     
@@ -439,14 +630,16 @@ Examples:
     parser.add_argument('--sender', help='Filter by sender email (partial match)')
     parser.add_argument('--recipient', help='Filter by recipient email (partial match)')
     parser.add_argument('--keywords', help='Search keywords in subject/body')
-    parser.add_argument('--start-date', help='Start date (YYYY-MM-DD format, default: no limit)')
-    parser.add_argument('--end-date', help='End date (YYYY-MM-DD format, default: no limit)')
+    parser.add_argument('--start-date', help='Start date (YYYY-MM-DD format, default: all time)')
+    parser.add_argument('--end-date', help='End date (YYYY-MM-DD format, default: all time)')
     
     # Options
     parser.add_argument('--case-sensitive', action='store_true',
                        help='Enable case-sensitive matching')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Enable verbose output showing messages under review')
+    parser.add_argument('--all-folders', action='store_true',
+                       help='Search all folders in mailbox (default: INBOX only)')
     parser.add_argument('--env', default='.env', 
                        help='Path to .env file (default: .env)')
     parser.add_argument('--export-dir', default='./export',
@@ -508,10 +701,11 @@ Examples:
         print(f"\n🔍 Search Configuration:")
         print(f"  IMAP Server: {config['mailhost']}:{config['mailport']} ({config['crypt']})")
         print(f"  Username: {config['username']}")
+        print(f"  Search scope: {'ALL FOLDERS' if args.all_folders else 'INBOX ONLY'}")
         print(f"  Sender filter: {config.get('sender', 'ANY')}")
         print(f"  Recipient filter: {config.get('recipient', 'ANY')}")
         print(f"  Keywords filter: {config.get('keywords', 'ANY')}")
-        print(f"  Date range: {start_date.strftime('%Y-%m-%d') if start_date else 'ALL'} to {end_date.strftime('%Y-%m-%d') if end_date else 'ALL'}")
+        print(f"  Date range: {start_date.strftime('%Y-%m-%d') if start_date else 'ALL TIME'} to {end_date.strftime('%Y-%m-%d') if end_date else 'ALL TIME'}")
         print(f"  Case sensitive: {args.case_sensitive}")
         print(f"  Export directory: {args.export_dir}\n")
     
@@ -526,7 +720,7 @@ Examples:
     
     try:
         # Search for messages
-        messages = search_messages(
+        messages = search_all_messages(
             imap_conn,
             config.get('sender'),
             config.get('recipient'), 
@@ -534,6 +728,7 @@ Examples:
             start_date,
             end_date,
             args.case_sensitive,
+            args.all_folders,
             args.verbose
         )
         
@@ -562,7 +757,7 @@ Examples:
         success_count = 0
         for i, message in enumerate(messages, 1):
             if args.verbose:
-                print(f"\n[{i}/{len(messages)}] Processing:")
+                print(f"\n[{i}/{len(messages)}] Processing from {message.get('folder', 'UNKNOWN')}:")
                 print(f"  From: {message['from']}")
                 print(f"  Subject: {message['subject']}")
             
@@ -577,6 +772,9 @@ Examples:
         # Clean up connection
         try:
             imap_conn.close()
+        except:
+            pass
+        try:
             imap_conn.logout()
         except:
             pass
