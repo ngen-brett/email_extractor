@@ -2,7 +2,7 @@
 """
 IMAP Email Search and Export Tool
 Connects to IMAP servers, searches messages, and exports to .eml and .pdf formats
-Enhanced: Multi-folder search capability and Unicode character support
+Enhanced: Multi-folder search, HTML-to-PDF rendering for professional output
 """
 
 import imaplib
@@ -16,89 +16,33 @@ from datetime import datetime
 from dotenv import load_dotenv
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
-from fpdf import FPDF
 import html2text
 from pathlib import Path
+from html import escape
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def clean_text_for_pdf(text):
-    """Clean text for PDF rendering, removing problematic Unicode characters"""
-    if not text:
-        return ""
-    
-    # Remove Zero Width characters that cause rendering issues
-    text = re.sub(r'[\u200B-\u200F\uFEFF\u202A-\u202E]', '', text)
-    
-    # Replace smart quotes and special characters with ASCII equivalents
-    text = text.replace('\u201C', '"').replace('\u201D', '"')  # Smart double quotes  
-    text = text.replace('\u2018', "'").replace('\u2019', "'")  # Smart single quotes/apostrophes
-    text = text.replace('\u2013', '-').replace('\u2014', '-')  # En dash, em dash
-    text = text.replace('\u2026', '...')  # Ellipsis
-    text = text.replace('\u2022', '*')    # Bullet point
-    text = text.replace('\u00B0', ' degrees ')  # Degree symbol
-    
-    # Remove control characters except newlines and tabs
-    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-    
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text)
-    text = text.strip()
-    
-    # Final safety check: keep only characters that can be encoded in latin-1
+# Try to import HTML-to-PDF libraries in order of preference
+PDF_ENGINE = None
+try:
+    from weasyprint import HTML, CSS
+    PDF_ENGINE = "weasyprint"
+    logger.info("Using WeasyPrint for PDF generation")
+except ImportError:
     try:
-        text.encode('latin-1')
-        return text
-    except UnicodeEncodeError:
-        # Filter to ASCII printable characters only
-        safe_chars = []
-        for char in text:
-            if ord(char) < 128 and (char.isprintable() or char in '\n\t '):
-                safe_chars.append(char)
-            else:
-                safe_chars.append('?')  # Replace problematic chars with ?
-        return ''.join(safe_chars)
-
-class EmailPDF(FPDF):
-    """Custom FPDF class for email formatting with headers and footers"""
-    
-    def __init__(self, email_subject=""):
-        super().__init__(orientation='P', unit='mm', format='A4')
-        self.email_subject = clean_text_for_pdf(email_subject)
-        # Set proper margins to prevent horizontal space issues
-        self.set_margins(left=20, top=20, right=20)
-        self.set_auto_page_break(auto=True, margin=25)
-        
-        # Add Unicode font support for special characters
+        import pdfkit
+        PDF_ENGINE = "pdfkit"
+        logger.info("Using pdfkit for PDF generation")
+    except ImportError:
         try:
-            # Try to add DejaVu font for Unicode support
-            self.add_font("DejaVu", "", "DejaVuSans.ttf")
-            self.unicode_font_available = True
-        except:
-            # Fall back to Arial if DejaVu not available
-            self.unicode_font_available = False
-    
-    def header(self):
-        """Page header"""
-        font_name = "DejaVu" if self.unicode_font_available else "Arial"
-        self.set_font(font_name, 'B', 12)
-        # Truncate and clean subject for header
-        header_text = self.email_subject[:50] + "..." if len(self.email_subject) > 50 else self.email_subject
-        try:
-            self.cell(0, 10, f'Email: {header_text}', 0, 1, 'C')
-        except:
-            # Fallback for problematic characters
-            self.cell(0, 10, 'Email: [Subject contains unsupported characters]', 0, 1, 'C')
-        self.ln(5)
-    
-    def footer(self):
-        """Page footer with page numbers"""
-        self.set_y(-15)
-        font_name = "DejaVu" if self.unicode_font_available else "Arial"
-        self.set_font(font_name, 'I', 8)
-        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+            from xhtml2pdf import pisa
+            PDF_ENGINE = "xhtml2pdf"
+            logger.info("Using xhtml2pdf for PDF generation")
+        except ImportError:
+            logger.warning("No HTML-to-PDF library found. Install weasyprint, pdfkit, or xhtml2pdf")
+            PDF_ENGINE = None
 
 def sanitize_filename(text):
     """Replace non-alphanumeric characters with hyphens for safe filenames"""
@@ -203,8 +147,8 @@ def decode_mime_words(s):
     
     return decoded_string
 
-def extract_text_from_email(msg):
-    """Extract text content from email message, handling multipart and HTML"""
+def extract_email_content(msg):
+    """Extract both HTML and plain text content from email message"""
     text_content = ""
     html_content = ""
     
@@ -248,18 +192,232 @@ def extract_text_from_email(msg):
         except Exception as e:
             logger.warning(f"Error extracting single part content: {e}")
     
-    # Prefer plain text, fall back to converted HTML
-    if text_content.strip():
-        return text_content.strip()
-    elif html_content.strip():
-        # Convert HTML to plain text
+    # Return both HTML and plain text, with fallbacks
+    if not html_content and text_content:
+        # Convert plain text to basic HTML
+        html_content = f"<pre>{escape(text_content)}</pre>"
+    elif not text_content and html_content:
+        # Convert HTML to plain text for search
         h = html2text.HTML2Text()
         h.ignore_links = False
         h.ignore_images = True
-        h.body_width = 0  # No line wrapping
-        return h.handle(html_content).strip()
+        h.body_width = 0
+        text_content = h.handle(html_content).strip()
+    
+    return {
+        'html': html_content.strip() if html_content else "",
+        'text': text_content.strip() if text_content else "No readable content found"
+    }
+
+def create_email_html(message, folder_name="UNKNOWN"):
+    """Create a professional HTML representation of the email"""
+    
+    html_template = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Email: {subject}</title>
+    <style>
+        body {{
+            font-family: Arial, Helvetica, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 20px;
+            line-height: 1.6;
+            background-color: #f9f9f9;
+        }}
+        
+        .email-container {{
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        
+        .email-header {{
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }}
+        
+        .header-table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        .header-table td {{
+            padding: 6px 0;
+            vertical-align: top;
+        }}
+        
+        .header-label {{
+            font-weight: bold;
+            color: #495057;
+            width: 80px;
+            padding-right: 10px;
+        }}
+        
+        .header-value {{
+            color: #212529;
+            word-break: break-word;
+        }}
+        
+        .email-subject {{
+            font-size: 1.2em;
+            font-weight: bold;
+            color: #1a73e8;
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e9ecef;
+        }}
+        
+        .email-body {{
+            background-color: white;
+            padding: 15px;
+            border-left: 4px solid #1a73e8;
+            margin-top: 20px;
+        }}
+        
+        .email-body pre {{
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: 'Courier New', Consolas, monospace;
+            font-size: 0.9em;
+            line-height: 1.4;
+            margin: 0;
+        }}
+        
+        .footer {{
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #e9ecef;
+            color: #6c757d;
+            font-size: 0.8em;
+            text-align: center;
+        }}
+        
+        @media print {{
+            body {{ margin: 0; padding: 10px; background-color: white; }}
+            .email-container {{ box-shadow: none; border: none; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="email-container">
+        <div class="email-subject">{subject}</div>
+        
+        <div class="email-header">
+            <table class="header-table">
+                <tr>
+                    <td class="header-label">Folder:</td>
+                    <td class="header-value">{folder}</td>
+                </tr>
+                <tr>
+                    <td class="header-label">Date:</td>
+                    <td class="header-value">{date}</td>
+                </tr>
+                <tr>
+                    <td class="header-label">From:</td>
+                    <td class="header-value">{from_addr}</td>
+                </tr>
+                <tr>
+                    <td class="header-label">To:</td>
+                    <td class="header-value">{to_addr}</td>
+                </tr>
+                {cc_row}
+                {bcc_row}
+            </table>
+        </div>
+        
+        <div class="email-body">
+            {body_content}
+        </div>
+        
+        <div class="footer">
+            Generated by IMAP Email Extractor on {export_date}
+        </div>
+    </div>
+</body>
+</html>"""
+
+    # Prepare CC and BCC rows only if they exist
+    cc_row = ""
+    if message.get('cc'):
+        cc_row = f"""<tr>
+            <td class="header-label">CC:</td>
+            <td class="header-value">{escape(message['cc'])}</td>
+        </tr>"""
+    
+    bcc_row = ""
+    if message.get('bcc'):
+        bcc_row = f"""<tr>
+            <td class="header-label">BCC:</td>
+            <td class="header-value">{escape(message['bcc'])}</td>
+        </tr>"""
+    
+    # Use HTML content if available, otherwise format plain text
+    if message['body_html']:
+        # For HTML emails, embed the HTML directly but sanitize
+        body_content = message['body_html']
     else:
-        return "No readable content found"
+        # For plain text emails, wrap in <pre> tags
+        body_content = f"<pre>{escape(message['body_text'])}</pre>"
+    
+    return html_template.format(
+        subject=escape(message['subject']),
+        folder=escape(folder_name),
+        date=escape(message['date_header']),
+        from_addr=escape(message['from']),
+        to_addr=escape(message['to']),
+        cc_row=cc_row,
+        bcc_row=bcc_row,
+        body_content=body_content,
+        export_date=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    )
+
+def html_to_pdf(html_content, output_path, verbose=False):
+    """Convert HTML content to PDF using available library"""
+    if not PDF_ENGINE:
+        logger.error("No PDF generation library available. Install weasyprint, pdfkit, or xhtml2pdf")
+        return False
+    
+    try:
+        if PDF_ENGINE == "weasyprint":
+            # WeasyPrint - best CSS support and output quality
+            HTML(string=html_content).write_pdf(output_path)
+            
+        elif PDF_ENGINE == "pdfkit":
+            # pdfkit - requires wkhtmltopdf system installation
+            options = {
+                'page-size': 'A4',
+                'margin-top': '0.75in',
+                'margin-right': '0.75in',
+                'margin-bottom': '0.75in',
+                'margin-left': '0.75in',
+                'encoding': "UTF-8",
+                'no-outline': None,
+                'enable-local-file-access': None
+            }
+            pdfkit.from_string(html_content, output_path, options=options)
+            
+        elif PDF_ENGINE == "xhtml2pdf":
+            # xhtml2pdf - pure Python but limited CSS support
+            with open(output_path, "w+b") as result_file:
+                pisa_status = pisa.CreatePDF(html_content, dest=result_file)
+                if pisa_status.err:
+                    logger.error(f"xhtml2pdf error: {pisa_status.err}")
+                    return False
+        
+        if verbose:
+            print(f"  ✅ Generated PDF using {PDF_ENGINE}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"PDF generation failed with {PDF_ENGINE}: {e}")
+        return False
 
 def load_env_config(env_path):
     """Load configuration from .env file"""
@@ -372,8 +530,8 @@ def search_folder_messages(imap_conn, folder_name, sender, recipient, keywords, 
                 # Combine all recipient fields
                 all_recipients = f"{to_addr} {cc_addr} {bcc_addr}".strip()
                 
-                # Extract body text
-                body_text = extract_text_from_email(email_message)
+                # Extract both HTML and text content
+                content = extract_email_content(email_message)
                 
                 # Verbose output - show message being reviewed
                 if verbose:
@@ -382,7 +540,7 @@ def search_folder_messages(imap_conn, folder_name, sender, recipient, keywords, 
                     print(f"      From: {from_addr}")
                     print(f"      To: {to_addr}")
                     print(f"      Subject: {subject}")
-                    print(f"      Body preview: {body_text[:100]}{'...' if len(body_text) > 100 else ''}")
+                    print(f"      Body preview: {content['text'][:100]}{'...' if len(content['text']) > 100 else ''}")
                 
                 # Apply filters
                 def matches(search_term, text_to_search):
@@ -395,7 +553,7 @@ def search_folder_messages(imap_conn, folder_name, sender, recipient, keywords, 
                 
                 sender_match = matches(sender, from_addr)
                 recipient_match = matches(recipient, all_recipients)
-                keyword_match = matches(keywords, f"{subject} {body_text}")
+                keyword_match = matches(keywords, f"{subject} {content['text']}")
                 
                 if verbose:
                     print(f"      Sender match: {sender_match} (searching for: {sender or 'ANY'})")
@@ -415,11 +573,14 @@ def search_folder_messages(imap_conn, folder_name, sender, recipient, keywords, 
                         "folder": folder_name,
                         "from": from_addr,
                         "to": to_addr,
+                        "cc": cc_addr,
+                        "bcc": bcc_addr,
                         "subject": subject,
                         "date": email_date,
                         "date_header": date_header,
                         "raw": raw_email,
-                        "body": body_text,
+                        "body_text": content['text'],
+                        "body_html": content['html'],
                         "email_obj": email_message
                     })
                     
@@ -469,7 +630,7 @@ def search_all_messages(imap_conn, sender, recipient, keywords, start_date, end_
     return all_matching_messages
 
 def save_message_files(message, export_folder, verbose=False):
-    """Save message as both .eml and .pdf files"""
+    """Save message as .eml, .html, and .pdf files"""
     try:
         # Generate filename components
         date_str = message["date"].strftime('%Y-%m-%d')
@@ -503,98 +664,24 @@ def save_message_files(message, export_folder, verbose=False):
         if verbose:
             print(f"  ✅ Saved EML: {eml_path}")
         
-        # Create PDF with Unicode support
-        pdf = EmailPDF(message["subject"])
-        pdf.add_page()
+        # Generate professional HTML
+        html_content = create_email_html(message, message.get('folder', 'UNKNOWN'))
         
-        # Clean all text for PDF rendering
-        safe_from = clean_text_for_pdf(message["from"])
-        safe_to = clean_text_for_pdf(message["to"])
-        safe_subject = clean_text_for_pdf(message["subject"])
-        safe_body = clean_text_for_pdf(message["body"])
-        safe_date = clean_text_for_pdf(message["date_header"])
-        safe_folder = clean_text_for_pdf(message.get("folder", "UNKNOWN"))
-        
-        # Choose font based on availability
-        font_name = "DejaVu" if pdf.unicode_font_available else "Arial"
-        
-        # Header information with safe layout
-        pdf.set_font(font_name, "B", 14)
-        pdf.cell(0, 10, "Email Message", ln=1, align="C")
-        pdf.ln(5)
-        
-        # Email metadata using only cell() to prevent multi_cell issues
-        pdf.set_font(font_name, "B", 10)
-        pdf.cell(25, 6, "Folder:", border=0)
-        pdf.set_font(font_name, "", 10)
-        pdf.cell(145, 6, safe_folder[:70], ln=1, border=0)
-        
-        pdf.set_font(font_name, "B", 10)
-        pdf.cell(25, 6, "Date:", border=0)
-        pdf.set_font(font_name, "", 10)
-        pdf.cell(145, 6, safe_date[:70], ln=1, border=0)
-        
-        pdf.set_font(font_name, "B", 10)
-        pdf.cell(25, 6, "From:", border=0)
-        pdf.set_font(font_name, "", 10)
-        pdf.cell(145, 6, safe_from[:70], ln=1, border=0)
-        
-        pdf.set_font(font_name, "B", 10)
-        pdf.cell(25, 6, "To:", border=0)
-        pdf.set_font(font_name, "", 10)
-        pdf.cell(145, 6, safe_to[:70], ln=1, border=0)
-        
-        pdf.set_font(font_name, "B", 10)
-        pdf.cell(25, 6, "Subject:", border=0)
-        pdf.set_font(font_name, "", 10)
-        pdf.cell(145, 6, safe_subject[:70], ln=1, border=0)
-        
-        pdf.ln(8)
-        pdf.set_font(font_name, "B", 10)
-        pdf.cell(0, 6, "Message Body:", ln=1, border=0)
-        pdf.ln(3)
-        
-        # Message body with conservative approach
-        pdf.set_font(font_name, "", 9)
-        
-        # Truncate extremely long bodies
-        if len(safe_body) > 5000:
-            safe_body = safe_body[:5000] + "\n\n[MESSAGE TRUNCATED - Original too long for PDF display]"
-        
-        # Split body into lines and use cell() for better control
-        body_lines = safe_body.split('\n')
-        for line in body_lines:
-            if len(line) > 80:
-                # Split very long lines
-                words = line.split(' ')
-                current_line = ""
-                for word in words:
-                    if len(current_line + word) < 80:
-                        current_line += word + " "
-                    else:
-                        if current_line:
-                            try:
-                                pdf.cell(0, 5, current_line.strip(), ln=1, border=0)
-                            except:
-                                pdf.cell(0, 5, "[Line contains unsupported characters]", ln=1, border=0)
-                        current_line = word + " "
-                if current_line:
-                    try:
-                        pdf.cell(0, 5, current_line.strip(), ln=1, border=0)
-                    except:
-                        pdf.cell(0, 5, "[Line contains unsupported characters]", ln=1, border=0)
-            else:
-                try:
-                    pdf.cell(0, 5, line, ln=1, border=0)
-                except:
-                    pdf.cell(0, 5, "[Line contains unsupported characters]", ln=1, border=0)
-        
-        # Save PDF
-        pdf_path = Path(export_folder) / f"{base_filename}.pdf"
-        pdf.output(str(pdf_path))
+        # Save .html file for reference/debugging
+        html_path = Path(export_folder) / f"{base_filename}.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
         
         if verbose:
-            print(f"  ✅ Saved PDF: {pdf_path}")
+            print(f"  ✅ Saved HTML: {html_path}")
+        
+        # Convert HTML to PDF
+        pdf_path = Path(export_folder) / f"{base_filename}.pdf"
+        if html_to_pdf(html_content, str(pdf_path), verbose):
+            if verbose:
+                print(f"  ✅ Saved PDF: {pdf_path}")
+        else:
+            logger.warning(f"Failed to generate PDF for {base_filename}")
         
         logger.info(f"Saved: {base_filename}")
         return True
@@ -608,13 +695,19 @@ def save_message_files(message, export_folder, verbose=False):
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="Search and export emails from IMAP servers",
+        description="Search and export emails from IMAP servers with professional PDF output",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s --mailhost imap.gmail.com --username user@gmail.com --password pass --sender boss@company.com
   %(prog)s --env config.env --keywords "urgent project" --start-date 2023-01-01 --all-folders
   %(prog)s --mailhost mail.company.com --crypt starttls --recipient client@company.com --verbose --all-folders
+
+PDF Requirements:
+  Install one of the following for PDF generation:
+  - pip install weasyprint (recommended)
+  - pip install pdfkit (requires wkhtmltopdf system installation)
+  - pip install xhtml2pdf (basic support)
         """
     )
     
@@ -646,6 +739,15 @@ Examples:
                        help='Export directory (default: ./export)')
     
     args = parser.parse_args()
+    
+    # Check PDF generation capability
+    if not PDF_ENGINE:
+        print("\n⚠️  WARNING: No PDF generation library installed!")
+        print("Install one of the following for PDF output:")
+        print("  pip install weasyprint      (recommended)")
+        print("  pip install pdfkit          (requires wkhtmltopdf)")
+        print("  pip install xhtml2pdf       (basic support)")
+        print("\nContinuing without PDF generation...\n")
     
     # Load environment configuration
     env_config = load_env_config(args.env)
@@ -707,7 +809,8 @@ Examples:
         print(f"  Keywords filter: {config.get('keywords', 'ANY')}")
         print(f"  Date range: {start_date.strftime('%Y-%m-%d') if start_date else 'ALL TIME'} to {end_date.strftime('%Y-%m-%d') if end_date else 'ALL TIME'}")
         print(f"  Case sensitive: {args.case_sensitive}")
-        print(f"  Export directory: {args.export_dir}\n")
+        print(f"  Export directory: {args.export_dir}")
+        print(f"  PDF engine: {PDF_ENGINE or 'None (install weasyprint/pdfkit/xhtml2pdf)'}\n")
     
     # Connect to IMAP server
     imap_conn = connect_imap(
@@ -767,6 +870,7 @@ Examples:
         logger.info(f"Successfully exported {success_count}/{len(messages)} messages")
         if args.verbose:
             print(f"\n✅ Export completed: {success_count}/{len(messages)} messages saved successfully")
+            print(f"Files saved: .eml (original), .html (formatted), .pdf (professional)")
         
     finally:
         # Clean up connection

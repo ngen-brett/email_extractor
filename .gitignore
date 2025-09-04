@@ -1,5 +1,6 @@
+**/.DS_Store
 prompt.txt
 **/*.log
 venv/**
 **/.env
-**/output
+**/export
