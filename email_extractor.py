@@ -201,24 +201,29 @@ def connect_imap(host, port, crypt, username, password):
         logger.error(f"Failed to connect to IMAP server: {e}")
         sys.exit(1)
 
-def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date, case_sensitive):
+def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date, case_sensitive, verbose=False):
     """Search for messages matching criteria"""
     logger.info("Searching for messages...")
     
     try:
         imap_conn.select("INBOX")
         
-        # Build search criteria
+        # Build search criteria - default to ALL (no date restriction)
         search_criteria = ["ALL"]
         
-        # Date range criteria
+        # Date range criteria (only if provided)
         if start_date:
             since_str = start_date.strftime("%d-%b-%Y")
             search_criteria.append(f'SINCE "{since_str}"')
+            logger.info(f"Searching from: {since_str}")
         
         if end_date:
             before_str = end_date.strftime("%d-%b-%Y") 
             search_criteria.append(f'BEFORE "{before_str}"')
+            logger.info(f"Searching until: {before_str}")
+        
+        if not start_date and not end_date:
+            logger.info("Searching all messages (no date range specified)")
         
         # Execute search
         typ, message_ids = imap_conn.search(None, *search_criteria)
@@ -228,12 +233,12 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
             return []
         
         ids = message_ids[0].split()
-        logger.info(f"Found {len(ids)} messages in date range")
+        logger.info(f"Found {len(ids)} messages in search range")
         
         # Filter messages by sender, recipient, and keywords
         matching_messages = []
         
-        for msg_id in ids:
+        for i, msg_id in enumerate(ids, 1):
             try:
                 typ, msg_data = imap_conn.fetch(msg_id, '(RFC822)')
                 if typ != "OK":
@@ -256,6 +261,15 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
                 # Extract body text
                 body_text = extract_text_from_email(email_message)
                 
+                # Verbose output - show message being reviewed
+                if verbose:
+                    print(f"\n[{i}/{len(ids)}] Reviewing message:")
+                    print(f"  Date: {date_header}")
+                    print(f"  From: {from_addr}")
+                    print(f"  To: {to_addr}")
+                    print(f"  Subject: {subject}")
+                    print(f"  Body preview: {body_text[:100]}{'...' if len(body_text) > 100 else ''}")
+                
                 # Apply filters
                 def matches(search_term, text_to_search):
                     if not search_term:
@@ -268,6 +282,12 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
                 sender_match = matches(sender, from_addr)
                 recipient_match = matches(recipient, all_recipients)
                 keyword_match = matches(keywords, f"{subject} {body_text}")
+                
+                if verbose:
+                    print(f"  Sender match: {sender_match} (searching for: {sender or 'ANY'})")
+                    print(f"  Recipient match: {recipient_match} (searching for: {recipient or 'ANY'})")
+                    print(f"  Keyword match: {keyword_match} (searching for: {keywords or 'ANY'})")
+                    print(f"  Overall match: {sender_match and recipient_match and keyword_match}")
                 
                 if sender_match and recipient_match and keyword_match:
                     # Parse email date
@@ -287,9 +307,14 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
                         "body": body_text,
                         "email_obj": email_message
                     })
-            
+                    
+                    if verbose:
+                        print(f"  ✅ MATCH FOUND - Added to results")
+                
             except Exception as e:
                 logger.warning(f"Error processing message {msg_id}: {e}")
+                if verbose:
+                    print(f"  ❌ ERROR processing message: {e}")
                 continue
         
         logger.info(f"Found {len(matching_messages)} matching messages")
@@ -299,7 +324,7 @@ def search_messages(imap_conn, sender, recipient, keywords, start_date, end_date
         logger.error(f"Error during message search: {e}")
         return []
 
-def save_message_files(message, export_folder):
+def save_message_files(message, export_folder, verbose=False):
     """Save message as both .eml and .pdf files"""
     try:
         # Generate filename components
@@ -322,10 +347,16 @@ def save_message_files(message, export_folder):
         if len(base_filename) > 200:
             base_filename = base_filename[:200]
         
+        if verbose:
+            print(f"Saving files with base name: {base_filename}")
+        
         # Save .eml file
         eml_path = Path(export_folder) / f"{base_filename}.eml"
         with open(eml_path, "wb") as f:
             f.write(message["raw"])
+        
+        if verbose:
+            print(f"  ✅ Saved EML: {eml_path}")
         
         # Create PDF with unbreakable header section
         pdf = EmailPDF(message["subject"])
@@ -371,11 +402,16 @@ def save_message_files(message, export_folder):
         pdf_path = Path(export_folder) / f"{base_filename}.pdf"
         pdf.output(str(pdf_path))
         
+        if verbose:
+            print(f"  ✅ Saved PDF: {pdf_path}")
+        
         logger.info(f"Saved: {base_filename}")
         return True
         
     except Exception as e:
         logger.error(f"Error saving message files: {e}")
+        if verbose:
+            print(f"  ❌ ERROR saving files: {e}")
         return False
 
 def main():
@@ -387,7 +423,7 @@ def main():
 Examples:
   %(prog)s --mailhost imap.gmail.com --username user@gmail.com --password pass --sender boss@company.com
   %(prog)s --env config.env --keywords "urgent project" --start-date 2023-01-01
-  %(prog)s --mailhost mail.company.com --crypt starttls --recipient client@company.com
+  %(prog)s --mailhost mail.company.com --crypt starttls --recipient client@company.com --verbose
         """
     )
     
@@ -403,12 +439,14 @@ Examples:
     parser.add_argument('--sender', help='Filter by sender email (partial match)')
     parser.add_argument('--recipient', help='Filter by recipient email (partial match)')
     parser.add_argument('--keywords', help='Search keywords in subject/body')
-    parser.add_argument('--start-date', help='Start date (YYYY-MM-DD format)')
-    parser.add_argument('--end-date', help='End date (YYYY-MM-DD format)')
+    parser.add_argument('--start-date', help='Start date (YYYY-MM-DD format, default: no limit)')
+    parser.add_argument('--end-date', help='End date (YYYY-MM-DD format, default: no limit)')
     
     # Options
     parser.add_argument('--case-sensitive', action='store_true',
                        help='Enable case-sensitive matching')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose output showing messages under review')
     parser.add_argument('--env', default='.env', 
                        help='Path to .env file (default: .env)')
     parser.add_argument('--export-dir', default='./export',
@@ -448,7 +486,7 @@ Examples:
         # Auto-detect based on port
         config['crypt'] = 'ssl' if config['mailport'] == 993 else 'starttls'
     
-    # Parse dates
+    # Parse dates (default to None for all-time search)
     start_date = None
     end_date = None
     
@@ -465,6 +503,17 @@ Examples:
         except ValueError:
             logger.error("Invalid end date format. Use YYYY-MM-DD")
             sys.exit(1)
+    
+    if args.verbose:
+        print(f"\n🔍 Search Configuration:")
+        print(f"  IMAP Server: {config['mailhost']}:{config['mailport']} ({config['crypt']})")
+        print(f"  Username: {config['username']}")
+        print(f"  Sender filter: {config.get('sender', 'ANY')}")
+        print(f"  Recipient filter: {config.get('recipient', 'ANY')}")
+        print(f"  Keywords filter: {config.get('keywords', 'ANY')}")
+        print(f"  Date range: {start_date.strftime('%Y-%m-%d') if start_date else 'ALL'} to {end_date.strftime('%Y-%m-%d') if end_date else 'ALL'}")
+        print(f"  Case sensitive: {args.case_sensitive}")
+        print(f"  Export directory: {args.export_dir}\n")
     
     # Connect to IMAP server
     imap_conn = connect_imap(
@@ -484,11 +533,14 @@ Examples:
             config.get('keywords'),
             start_date,
             end_date,
-            args.case_sensitive
+            args.case_sensitive,
+            args.verbose
         )
         
         if not messages:
             logger.info("No matching messages found")
+            if args.verbose:
+                print("\n❌ No messages matched your search criteria")
             return
         
         # Create export folder
@@ -502,14 +554,24 @@ Examples:
         )
         
         logger.info(f"Export folder: {export_folder}")
+        if args.verbose:
+            print(f"\n📁 Export folder: {export_folder}")
+            print(f"\n💾 Saving {len(messages)} matching messages...")
         
         # Export messages
         success_count = 0
-        for message in messages:
-            if save_message_files(message, export_folder):
+        for i, message in enumerate(messages, 1):
+            if args.verbose:
+                print(f"\n[{i}/{len(messages)}] Processing:")
+                print(f"  From: {message['from']}")
+                print(f"  Subject: {message['subject']}")
+            
+            if save_message_files(message, export_folder, args.verbose):
                 success_count += 1
         
         logger.info(f"Successfully exported {success_count}/{len(messages)} messages")
+        if args.verbose:
+            print(f"\n✅ Export completed: {success_count}/{len(messages)} messages saved successfully")
         
     finally:
         # Clean up connection
