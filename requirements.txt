@@ -1,6 +1,93 @@
-python-dotenv
 fpdf2
-html2text
-weasyprint
 pdfkit
 xhtml2pdf
+
+# IMAP Email Extractor Requirements
+# Updated for Privacy Mode and Enhanced PDF Generation
+
+# Core dependencies
+python-dotenv>=1.0.0
+html2text>=2020.1.16
+
+# PDF generation libraries (install at least one)
+# Choose based on your needs and system requirements:
+
+# Option 1: WeasyPrint (RECOMMENDED - best output quality)
+# - Excellent CSS support and Unicode handling
+# - Professional PDF output with proper typography
+# - Pure Python with some system dependencies
+weasyprint>=61.0
+
+# Option 2: pdfkit (excellent quality, requires system installation)
+# - Requires wkhtmltopdf system binary
+# - Excellent CSS support and rendering quality
+# - More complex setup but very reliable
+# pdfkit>=1.0.0
+# System requirement: wkhtmltopdf
+# Ubuntu/Debian: sudo apt-get install wkhtmltopdf
+# macOS: brew install wkhtmltopdf  
+# Windows: Download from https://wkhtmltopdf.org/downloads.html
+
+# Option 3: xhtml2pdf (basic support, easiest installation)
+# - Pure Python, no system dependencies
+# - Limited CSS support but works everywhere
+# - Good fallback option
+# xhtml2pdf>=0.2.5
+
+# Built-in Python modules (no installation required)
+# imaplib - IMAP protocol handling
+# email - Email parsing and manipulation
+# argparse - Command line argument parsing
+# os, re, sys - System utilities
+# logging - Application logging
+# datetime - Date and time handling
+# pathlib - Modern path handling
+# html - HTML escaping and processing
+
+# Optional dependencies for enhanced functionality
+# beautifulsoup4>=4.11.0  # Enhanced HTML processing (if needed)
+# lxml>=4.9.0             # XML/HTML parsing (if needed)
+
+# Development dependencies (uncomment for development)
+# pytest>=7.0.0           # Testing framework
+# black>=22.0.0           # Code formatting
+# flake8>=5.0.0           # Code linting
+# mypy>=0.991             # Type checking
+
+# Installation Examples:
+
+# Basic installation (recommended):
+# pip install -r requirements.txt
+
+# Manual installation with WeasyPrint:
+# pip install python-dotenv html2text weasyprint
+
+# Manual installation with xhtml2pdf (simplest):
+# pip install python-dotenv html2text xhtml2pdf
+
+# Full installation with all PDF engines:
+# pip install python-dotenv html2text weasyprint pdfkit xhtml2pdf
+
+# System dependencies for WeasyPrint (if needed):
+# Ubuntu/Debian:
+# sudo apt-get install python3-dev python3-pip python3-cffi python3-brotli libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0
+
+# macOS (using Homebrew):
+# brew install cairo pango gdk-pixbuf libffi
+
+# Privacy Mode Features:
+# All privacy functionality is built into the core script
+# No additional dependencies required for email redaction
+# Uses built-in regex and string manipulation
+
+# Version Notes:
+# - python-dotenv: Environment variable management
+# - html2text: Converting HTML email content to plain text
+# - weasyprint: Primary PDF generation (recommended)
+# - All other functionality uses Python standard library
+
+# Compatibility:
+# - Python 3.7+ required
+# - Cross-platform: Windows, macOS, Linux
+# - Works with all major email providers (Gmail, Outlook, Yahoo, etc.)
+# - Compatible with corporate IMAP servers
