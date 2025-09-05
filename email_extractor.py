@@ -566,6 +566,22 @@ def create_redacted_eml(message, privacy_mode=False):
         logger.warning(f"Error creating redacted EML: {e}")
         return message["raw"]  # Return original if redaction fails
 
+
+def strip_cid_images(html):
+    """
+    Replace <img src="cid:..."> tags with a neutral placeholder.
+    """
+    placeholder = "<span style='color:#888;front-style:italic;'>[email image omitted]</span>"
+    # Replace any <img ... src="cid:..."> tag, case-insensitive
+    html = re.sub(
+            r"<img//b[^>]*\\bsrc=['\"]cid:[^'\"]+['\"][^>]*>",
+            placeholder,
+            html,
+            flags=re.IGNORECASE
+            )
+    return html
+
+
 def html_to_pdf(html_content, output_path, verbose=False):
     """Convert HTML content to PDF using available library with Letter size and 0.5" margins"""
     if not PDF_ENGINE:
@@ -573,6 +589,9 @@ def html_to_pdf(html_content, output_path, verbose=False):
             print("  ❌ No PDF engine available")
         return False
     
+    # Preprocess HTML content & replace inline images
+    html_content = strip_cid_images(html_content)
+
     try:
         if PDF_ENGINE == "weasyprint":
             # WeasyPrint - best CSS support and output quality
